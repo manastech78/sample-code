@@ -1,0 +1,967 @@
+<?php
+
+namespace App\Http\Controllers\frontend;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Cart;
+use App\Models\Product;
+use Illuminate\Support\Facades\Auth;
+use App\Http\Traits\Helper;
+use App\Models\category;
+use App\Models\Currency;
+use App\Models\FreeShipping;
+use Illuminate\Support\Str;
+use App\Models\Setting;
+use App\Models\Voucher;
+use App\Models\User;
+use App\Models\Order;
+use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\Log;
+use App\Models\StockLogTable;
+use App\Models\SeoContent;
+
+
+class CartController extends Controller
+{
+
+    use Helper;
+    /**
+     * function details:
+     * Showing cart
+     * @date 12/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     * @return view
+     */
+    public function cart()
+    {
+        $seo = SeoContent::where('page', 'cart')->first();
+        $cartitems = Cart::getContent();
+        $empty_cart = Cart::isEmpty();
+        $settings = Setting::get();
+        $misc_data = $this->misc_setting();
+        if (Auth::check()) {
+            $vat_status = User::where('id', Auth::user()->id)->value('vat_status');
+            if ($vat_status == 'yes') {
+                $vat = $misc_data['vat'];
+            } else {
+                $vat = 0;
+            }
+        } else {
+            $vat = $misc_data['vat'];
+        }
+        $addvat = (Cart::getSubTotal() * $vat) / 100;
+        // return $cartitems->toArray();
+        $prod_cat = category::where('parent_id', '=', '0')->first();
+        $prod_subcat = category::where('parent_id', $prod_cat['id'])->first();
+        if (Auth::check()) {
+            $login = 1;
+        } else {
+            $login = 0;
+        }
+        if (Cart::getTotalQuantity() == 0) {
+            Cart::clear();
+            Cart::clearCartConditions();
+            $total = 0.00;
+            return view('frontend.pages.order.cart', compact('empty_cart', 'prod_cat', 'prod_subcat', 'settings', 'seo', 'login', 'total'));
+        } else {
+            foreach ($cartitems->sort() as $item) {
+                $offer_qty = 0;
+                $offer = "";
+                $get_prod = Product::where('id', $item->id)->first();
+                ##Offer Section ###
+                if (Auth::check() && Auth::User()->user_type == 'trader') {
+                    $user = User::where('id', Auth::User()->id)->first();
+                    $offer = $user['offer_type'];
+                    $offer_qty = @$item->attributes->offer_qty;
+                }
+                ###END Offer section ###
+                if (Auth::check() && Auth::User()->user_type == 'trader') {
+                    $price = $item->price;
+                    $price_sum = Cart::get($item->id)->getPriceSum();
+                } else {
+                    $price = $item->price + ($item->price * $vat) / 100;
+                    $price_sum = Cart::get($item->id)->getPriceSum() + (Cart::get($item->id)->getPriceSum() * $vat) / 100;
+                }
+                $prod = array(
+
+                    'id' => $item->id,
+                    'name' => $item->name,
+                    'quantity' => $item->quentity,
+                    'price_sum' => $price_sum,
+                    'latin_name' => $get_prod['latin_name'],
+                    'size' => $item->attributes->size,
+                    'quantity' => $item->quantity,
+                    'price' => $price,
+                    'min_order' => $item->attributes->min_order,
+                    'image' => $get_prod['images'],
+                    'offer_qty' => $offer_qty != 0 ? $offer_qty : 0,
+                    'seo_title' => $get_prod['seo_title']
+
+                );
+                $data[] = $prod;
+            }
+            $taxcondition = new \Darryldecode\Cart\CartCondition(array(
+                'name' => 'VAT',
+                'type' => 'tax',
+                'target' => 'total',
+                'value' => $addvat,
+                'order' => 2
+            ));
+            Cart::condition($taxcondition);
+            $ship = "";
+            $location = "";
+            $ship_val = "";
+            $ship = Cart::getCondition('Shipping');
+            if ($ship != "") {
+                $location = $ship->getType();
+                $ship_val = $ship->getValue();
+            }
+            $shipping = $misc_data['shipping'];
+            $subtotal = Cart::getSubTotal();
+            /*$total = Cart::getTotal() + $addvat + $shipping;*/
+            $total = Cart::getTotal();
+            $cartstatus = Cart::isEmpty();
+            /*Create collection*/
+            $collection = new Collection();
+            foreach ($cartitems->sort() as $item) {
+                $collection->push((object)[
+                    'id' => $item->id,
+                    'name' => $item->name,
+                    'quantity' => $item->quentity,
+                    'price_sum' => Cart::get($item->id)->getPriceSum(),
+                    'latin_name' => $get_prod['latin_name'],
+                    'size' => $item->attributes->size,
+                    'quantity' => $item->quantity,
+                    'price' => $item->price,
+                    'min_order' => $item->attributes->min_order,
+                    'image' => $get_prod['images']
+
+                ]);
+            }
+            $subtotal = $collection->sum('price_sum');
+            $discount = Cart::getCondition('discount');
+            $discount_val = 0.00;
+            $dis_code = "";
+            $incl_vat = $subtotal + $addvat;
+            if ($discount != "") {
+                $attr = $discount->getAttributes();
+                /*  $subtotal=Cart::getSubTotal();*/
+                $dis_code = $discount->getType();
+                $discount_val = $discount->getCalculatedValue($subtotal);
+                $incl_vat = ($subtotal - $discount_val) + $addvat;
+            }
+            $order_note = session('order_note');
+            if (Auth::check()) {
+                if (Auth::User()->user_type == 'trader') {
+                    $voucherView = 0;
+                } else {
+                    $voucherView = 1;
+                }
+            } else {
+                $voucherView = 1;
+            }
+            $bal_val = "0.00";
+            $payable = $total;
+            $bal = Cart::getCondition('adjustment');
+            if ($bal != "") {
+                $attr_bal = $bal->getAttributes();
+                $bal_val = $attr_bal['bal'];
+                $payable = $total;
+            }
+            if ($ship_val == "") {
+                $grandTotal = $incl_vat;
+            } else {
+                $grandTotal = $incl_vat + $ship_val;
+            }
+            return view('frontend.pages.order.cart', compact('data', 'subtotal', 'total', 'cartstatus', 'empty_cart', 'addvat', 'shipping', 'prod_cat', 'prod_subcat', 'location', 'settings', 'ship_val', 'discount_val', 'dis_code', 'offer', 'incl_vat', 'order_note', 'seo', 'voucherView', 'bal_val', 'payable', 'login', 'grandTotal'));
+        }
+    }
+    /**
+     * function details:
+     * Checkout Page
+     * @date 12/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     * @return view
+     */
+    public function checkout()
+    {
+        $ship = Cart::getCondition('Shipping');
+        if ($ship == "") {
+            return redirect('/cart');
+        } else if (Cart::isEmpty() == 1) {
+            return redirect('/');
+        }
+        if (Auth::check() && $ship != "") {
+            return redirect('/order-confirm');
+        }
+        $location = $ship->getType();
+        $settings = Setting::get();
+        return view('frontend.pages.order.checkout', compact('settings', 'location'));
+    }
+    /**
+     * function details:
+     * Order Confirmation
+     * @date 12/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     * @return view
+     */
+    public function orderConfirm()
+    {
+        try {
+
+            $ship = Cart::getCondition('Shipping');
+            if ($ship == "") {
+                return redirect('/cart');
+            }
+            $cartitems = Cart::getContent();
+            foreach ($cartitems as $value) {
+                $value->put('category', $value->associatedModel->category_id);
+            }
+            $check_qty = "";
+            if (Auth::check() && Auth::User()->user_type == 'trader') {
+                $check_qty = $cartitems->where('quantity', '<', 3)->where('category', '!=', 15)->count();
+            }
+            $misc_data = $this->misc_setting();
+            if (Auth::check()) {
+                $user = User::where('id', Auth::User()->id)->first();
+            } else {
+                $user_id = session('user_id');
+                $user = User::where('id', $user_id)->first();
+            }
+            $billing = session('billing');
+            $phone = $user['phone'];
+            $shipping = session('shipping');
+            $data = [];
+            foreach ($cartitems->sort() as $item) {
+                $offer_qty = 0;
+                $offer = "";
+                $get_prod = Product::where('id', $item->id)->first();
+                ##Offer Section ###
+                if (Auth::check() && Auth::User()->user_type == 'trader') {
+                    $user = User::where('id', Auth::User()->id)->first();
+                    $offer = $user['offer_type'];
+                    if ($user['offer'] == 'yes') {
+                        if ($user['offer_type'] == 'offer1') {
+                            $total_item = $item->quantity;
+                            $qty = $total_item / 5;
+                            $offer_qty = (int)$qty;
+                        }
+                        if ($user['offer_type'] == 'offer2') {
+                            $total_item = $item->quantity;
+                            $qty = $total_item / 6;
+                            $offer_qty = (int)$qty;
+                        }
+                    }
+                }
+                ###END Offer section ###
+                if (Auth::check() && Auth::User()->user_type == 'trader') {
+                    $price = $item->price;
+                    $price_sum = Cart::get($item->id)->getPriceSum();
+                } else {
+                    $price = $item->price + ($item->price * $misc_data['vat']) / 100;
+                    $price_sum = Cart::get($item->id)->getPriceSum() + (Cart::get($item->id)->getPriceSum() * $misc_data['vat']) / 100;
+                }
+                $prod = array(
+                    'id' => $item->id,
+                    'name' => $item->name,
+                    'quantity' => $item->quentity,
+                    'price_sum' => $price_sum,
+                    'latin_name' => $get_prod['latin_name'],
+                    'size' => $item->attributes->size,
+                    'quantity' => $item->quantity,
+                    'price' => $price,
+                    'min_order' => $item->attributes->min_order,
+                    'image' => $get_prod['images'],
+                    'cart_offer' => $item->attributes->offer_qty,
+                    'offer_qty' => $offer_qty != 0 ? $offer_qty : 0,
+                    'seo_title' => $get_prod['seo_title']
+                );
+                $data[] = $prod;
+            }
+            $collection = new Collection();
+            foreach ($cartitems->sort() as $item) {
+                $collection->push((object)[
+                    'id' => $item->id,
+                    'name' => $item->name,
+                    'quantity' => $item->quentity,
+                    'price_sum' => Cart::get($item->id)->getPriceSum(),
+                    'latin_name' => $get_prod['latin_name'],
+                    'size' => $item->attributes->size,
+                    'quantity' => $item->quantity,
+                    'price' => $item->price,
+                    'min_order' => $item->attributes->min_order,
+                    'image' => $get_prod['images']
+
+                ]);
+            }
+            $ship = "";
+            $location = "";
+            $ship_val = "";
+            $ship = Cart::getCondition('Shipping');
+            $discount = Cart::getCondition('discount');
+            $discount_val = "";
+            $shipping_temp = $misc_data['shipping'];
+            $subtotal = Cart::getSubTotal();
+            $total = Cart::getTotal();
+            $cartstatus = Cart::isEmpty();
+            $tax = Cart::getCondition('VAT');
+            $vat = $tax->getCalculatedValue($subtotal);
+            $incl_vat = ($subtotal) + $vat;
+            if ($discount != "") {
+                $attr = $discount->getAttributes();
+                $subtotal = $collection->sum('price_sum');
+                $discount_val = $discount->getCalculatedValue($subtotal);
+                $incl_vat = ($subtotal - $discount_val) + $vat;
+            }
+            if ($ship != "") {
+                $location = $ship->getType();
+                $ship_val = $ship->getCalculatedValue($total);
+            }
+            $settings = Setting::get();
+            $bal_val = 0.00;
+            $payable = $total;
+            $bal = Cart::getCondition('adjustment');
+            if ($bal != "") {
+                $attr_bal = $bal->getAttributes();
+                $bal_val = $attr_bal['bal'];
+                $payable = $total;
+            }
+            return view('frontend.pages.order.order-confirm', compact('data', 'ship_val', 'vat', 'subtotal', 'total', 'billing', 'user', 'shipping', 'discount_val', 'settings', 'location', 'check_qty', 'offer', 'incl_vat', 'bal_val', 'payable'));
+        } catch (\Exception $e) {
+
+            Log::error(" :: EXCEPTION :: " . $e->getMessage() . "\n" . $e->getTraceAsString());
+            abort(500);
+        }
+    }
+    /**
+     * function details:
+     * Add item in cart
+     * @date 12/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function Cartadd(Request $request)
+    {
+        ##Condition for trader order quentity##
+        $offer_qty = 0;
+        if (Auth::check()) {
+            if (Auth::User()->user_type == "trader") {
+                $prod_cat = Product::where('id', $request->prod_id)->first();
+                if ($request->quantity < $prod_cat['min_order_qty']) {
+                    return response(array(
+                        'message' => 'Minimum order quantity 3',
+                    ), 200, []);
+                }
+            }
+        }
+        ##Offer Section ###
+        if (Auth::check() && Auth::User()->user_type == 'trader') {
+            $user = User::where('id', Auth::User()->id)->first();
+            if ($user['offer'] == 'yes') {
+                if ($user['offer_type'] == 'offer1') {
+                    $item = @Cart::get($request->prod_id)->quantity;
+                    $total_item = $item + $request->quantity;
+                    $qty = $total_item / 5;
+                    $offer_qty = (int)$qty;
+                }
+                if ($user['offer_type'] == 'offer2') {
+                    $item = @Cart::get($request->prod_id)->quantity;
+                    $total_item = $item + $request->quantity;
+                    $qty = $total_item / 6;
+                    $offer_qty = (int)$qty;
+                }
+            }
+        }
+        ###END Offer section ###
+        $cartCollection = Cart::getContent();
+        $total_qty = StockLogTable::where('product_id', $request->prod_id)->sum('qty');
+        $product = Product::where('id', $request->prod_id)->first();
+        $stock = $total_qty - $product['total_sold'];
+        $item = @Cart::get($request->prod_id)->quantity;
+        $total_item = $item + $request->quantity;
+        if ($stock == 0) {
+            $CartTotalQuentity = Cart::getTotalQuantity();
+            return response(array(
+                'value' => 0,
+                'message' => 'Product out of stock',
+                'cartitem' => $CartTotalQuentity,
+                'item' => @$total_item
+            ), 200, []);
+        }
+        if ($stock < $total_item) {
+            $CartTotalQuentity = Cart::getTotalQuantity();
+            return response(array(
+                'value' => 0,
+                'message' => 'Only ' . ($stock < 0 ? 0 : $stock) . ' available in stock',
+                'cartitem' => $CartTotalQuentity,
+                'item' => @$total_item
+
+            ), 200, []);
+        }
+        $id = $request->prod_id;
+        $product = Product::where('id', $id)->first();
+        $name = $product['product_name'];
+        $currency = getDomain('currency');
+        if (!empty(Auth::user()->user_type) && Auth::User()->user_type == 'trader') {
+
+            if ($currency == 'GBP') {
+                $starling_price = Currency::where('code', 'GBP')->value('value');
+                $price = $product['trade_price'] * $starling_price;
+            } else {
+                $price = $product['trade_price'];
+            }
+        } else {
+            if ($currency == 'GBP') {
+                $starling_price = Currency::where('code', 'GBP')->value('value');
+                $price = $price = $product['retail_price'] * $starling_price;
+            } else {
+                $price = $price = $product['retail_price'];
+            }
+        }
+
+        $quantity = $request->quantity;
+        $size = $product['size'];
+        $min_order = $product['min_order_qty'];
+        $getcartcontant = Cart::getContent()->count();
+        $initilCartTotalQuentity = Cart::getTotalQuantity();
+        $Product = product::find($id);
+        Cart::add(array(
+            'id' => $id, // inique row ID
+            'name' => $name,
+            'price' => round($price, 2),
+            'quantity' => $quantity,
+            'attributes' => array(
+                'size' => $size,
+                'min_order' => $min_order,
+                'offer_qty' => $offer_qty,
+                'offer_price' => 0.00
+            ),
+            'associatedModel' => $product,
+        ));
+        //===================================
+        //Checking if quentity or iteam increase
+        $finalcount = Cart::getContent()->count();
+        $finalCartTotalQuentity = Cart::getTotalQuantity();
+        if ($finalcount > $getcartcontant || $finalCartTotalQuentity > $initilCartTotalQuentity) {
+            echo $finalCartTotalQuentity;
+        } else {
+            echo "failed";
+        }
+    }
+    /**
+     * function details:
+     * Update item in cart
+     * @date 13/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function CartUpdate(Request $request)
+    {
+        try {
+
+            $total_qty = StockLogTable::where('product_id', $request->id)->sum('qty');
+            $product = Product::where('id', $request->id)->first();
+            $stock = $total_qty - $product['total_sold'];
+            $item = @Cart::get($request->id)->quantity;
+            $size = @Cart::get($request->id)->attributes->size;
+            $min_order = @Cart::get($request->id)->attributes->min_order;
+            $total_item = $request->value;
+            $offer_qty = 0;
+            if (Auth::check() && Auth::User()->user_type == 'trader') {
+                $user = User::where('id', Auth::User()->id)->first();
+                if ($user['offer'] == 'yes') {
+                    if ($user['offer_type'] == 'offer1') {
+                        $total_item = $request->value;
+                        $qty = $total_item / 5;
+                        $offer_qty = (int)$qty;
+                    }
+                    if ($user['offer_type'] == 'offer2') {
+                        $total_item = $request->value;
+                        $qty = $total_item / 6;
+                        $offer_qty = (int)$qty;
+                    }
+                }
+            }
+            if (Auth::check()) {
+                if (Auth::User()->user_type == "trader") {
+                    if ($request->value < $product['min_order_qty']) {
+                        return response(array(
+                            'message' => 'Minimum order quantity ' . $product['min_order_qty'],
+                        ), 200, []);
+                    }
+                }
+            }
+            if ($stock == 0) {
+                $CartTotalQuentity = Cart::getTotalQuantity();
+                return response(array(
+                    'value' => 0,
+                    'message' => 'Product out of stock',
+                    'cartitem' => $CartTotalQuentity,
+                    'item' => @$total_item
+                ), 200, []);
+            }
+            if ($stock < $total_item) {
+                $CartTotalQuentity = Cart::getTotalQuantity();
+                return response(array(
+                    'value' => 0,
+                    'message' => 'Only ' . ($stock < 0 ? 0 : $stock) . ' available in stock',
+                    'cartitem' => $CartTotalQuentity,
+                    'item' => @$total_item
+
+                ), 200, []);
+            }
+            Cart::update(
+                $request->id,
+                array(
+                    'quantity' => array(
+                        'relative' => false,
+                        'value' => $request->value,
+                    ),
+                    'attributes' => array(
+                        'size' => $size,
+                        'min_order' => $min_order,
+                        'offer_qty' => $offer_qty,
+                        'offer_price' => 0.00
+                    ),
+                )
+            );
+            $misc_data = $this->misc_setting();
+            $shipping = $misc_data['shipping'];
+            $vat = $misc_data['vat'];
+            $subtotal = Cart::getSubTotal();
+            $addvat = (Cart::getSubTotal() * $vat) / 100;
+            $total = Cart::getTotal();
+            $cartstatus = Cart::isEmpty();
+            $ship = Cart::getCondition('Shipping');
+            $ship_val = 0.00;
+            if ($ship != "") {
+                $location = $ship->getType();
+                $shipping = Setting::where('shipping_location', $location)->first();
+                $ship_val = $ship->getValue();
+                if (Auth::check()) {
+                    if (Auth::user()->user_type == 'trader') {
+                        $freeShipping = FreeShipping::first();
+                        if ($subtotal > $freeShipping['amount']) {
+                            $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                                'name' => 'Shipping',
+                                'type' => $shipping['shipping_location'],
+                                'target' => 'total',
+                                'value' => 0.00,
+                                'order' => 3
+                            ));
+                        } else {
+                            $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                                'name' => 'Shipping',
+                                'type' => $shipping['shipping_location'],
+                                'target' => 'total',
+                                'value' => $shipping['shipping_charge'],
+                                'order' => 3
+                            ));
+                        }
+                    } else {
+                        $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                            'name' => 'Shipping',
+                            'type' => $shipping['shipping_location'],
+                            'target' => 'total',
+                            'value' => $shipping['shipping_charge'],
+                            'order' => 3
+                        ));
+                    }
+                } else {
+                    $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                        'name' => 'Shipping',
+                        'type' => $shipping['shipping_location'],
+                        'target' => 'total',
+                        'value' => $shipping['shipping_charge'],
+                        'order' => 3
+                    ));
+                }
+                Cart::condition($shipcondition);
+            }
+            return response(array(
+                'message' => 'success',
+                'cartcount' => Cart::getTotalQuantity(),
+                'content' => Cart::getContent(),
+                'subtotal' => Cart::getSubTotal(),
+                'addvat' => $addvat,
+                'total' => $total,
+            ), 200, []);
+        } catch (Exception $e) {
+            return response(array(
+                'message' => 'failed',
+            ), 404, []);
+        }
+    }
+    /**
+     * function details:
+     * Delete item from cart
+     * @date 13/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function CartDelete(Request $request)
+    {
+        try {
+            Cart::remove($request->valcode);
+            \Session::forget('order_note');
+            return 'success';
+        } catch (Exception $e) {
+            return failed;
+        }
+    }
+    /**
+     * function details:
+     * Update update shipping in cart
+     * @date 13/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function UpdateShipping(Request $request)
+    {
+        try {
+
+            if ($request->location_name == '0') {
+                Cart::removeCartCondition('Shipping');
+                return response(array(
+
+                    'message' => 'success',
+                    'cartcount' => Cart::getTotalQuantity(),
+                    'ship' => number_format((float)0, 2, '.', ''),
+                    'total' => number_format((float)Cart::getTotal(), 2, '.', '')
+                ), 200, []);
+            }
+            $subtotal = Cart::getSubTotal();
+            $shipping = Setting::where('shipping_location', $request->location_name)->first();
+            if (Auth::check()) {
+                if (Auth::user()->user_type == 'trader') {
+                    $freeShipping = FreeShipping::first();
+                    if ($subtotal > $freeShipping['amount']) {
+                        $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                            'name' => 'Shipping',
+                            'type' => $shipping->shipping_location,
+                            'target' => 'total',
+                            'value' => 0.00,
+                            'order' => 3
+                        ));
+                    } else {
+                        $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                            'name' => 'Shipping',
+                            'type' => $shipping->shipping_location,
+                            'target' => 'total',
+                            'value' => $shipping->shipping_charge,
+                            'order' => 3
+                        ));
+                    }
+                } else {
+                    $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                        'name' => 'Shipping',
+                        'type' => $shipping->shipping_location,
+                        'target' => 'total',
+                        'value' => $shipping->shipping_charge,
+                        'order' => 3
+                    ));
+                }
+            } else {
+                $shipcondition = new \Darryldecode\Cart\CartCondition(array(
+                    'name' => 'Shipping',
+                    'type' => $shipping->shipping_location,
+                    'target' => 'total',
+                    'value' => $shipping->shipping_charge,
+                    'order' => 3
+                ));
+            }
+            Cart::condition($shipcondition);
+            $ship = Cart::getCondition('Shipping');
+            $ship_val = "";
+            if ($ship != "") {
+                $location = $ship->getType();
+                $ship_val = $ship->getValue();
+            }
+
+            return response(array(
+                'message' => 'success',
+                'cartcount' => Cart::getTotalQuantity(),
+                'ship' => number_format((float)$ship_val, 2, '.', ''),
+                'total' => number_format((float)Cart::getTotal(), 2, '.', '')
+            ), 200, []);
+        } catch (Exception $e) {
+            return response(array(
+                'message' => 'failed',
+            ), 404, []);
+        }
+    }
+    /**
+     * function details:
+     * Adding discount in cart
+     * @date 13/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function VoucherDiscount(Request $request)
+    {
+        $voucher = Voucher::where('code', $request->voucher)->first();
+        if ($voucher == "") {
+            return 'Invalid Voucher Code';
+        }
+        $date = date('Y-m-d', strtotime(date('Y-m-d')));
+
+        if ($voucher['type'] == 'single') {
+
+            if ($voucher['used_status'] == 1) {
+
+                return 'Voucher already used';
+            } else if ($voucher['status'] == 0) {
+
+                return 'Voucher disabled';
+            } else if ($voucher['expiry_date'] < $date) {
+
+                return 'Voucher expired';
+            } else {
+
+                $discountcondition = new \Darryldecode\Cart\CartCondition(array(
+                    'name' => 'discount',
+                    'type' => $voucher['code'],
+                    'target' => 'subtotal',
+                    'value' => '-' . $voucher['discount'] . '%',
+                    'order' => 1,
+                    'attributes' => array( // attributes field is optional
+                        'original' => Cart::getSubTotal(),
+                    )
+                ));
+                $misc_data = $this->misc_setting();
+                Cart::condition($discountcondition);
+                $cartitems = Cart::getContent();
+                $collection = new Collection();
+                foreach ($cartitems->sort() as $item) {
+                    $collection->push((object)[
+                        'id' => $item->id,
+                        'name' => $item->name,
+                        'quantity' => $item->quentity,
+                        'price_sum' => Cart::get($item->id)->getPriceSum(),
+                    ]);
+                }
+                $ship = Cart::getCondition('Shipping');
+                $ship_val = 0.00;
+                if ($ship != "") {
+                    $location = $ship->getType();
+                    $ship_val = $ship->getValue();
+                }
+
+                $discount = Cart::getCondition('discount');
+                $discount_val = "";
+                $vat = (Cart::getSubTotal() * $misc_data['vat']) / 100;
+                $incl_vat = Cart::getSubTotal() + $vat;
+                if ($discount != "") {
+                    $discount_val = $discount->getCalculatedValue($collection->sum('price_sum'));
+                    $incl_vat = Cart::getSubTotal() + $vat;
+                }
+                return response(array(
+
+                    'message' => 'success',
+                    'subtotal' => number_format((float)$collection->sum('price_sum'), 2, '.', ''),
+                    'discount' => number_format((float)$discount_val, 2, '.', ''),
+                    'ship' => number_format((float)$ship_val, 2, '.', ''),
+                    'total' => number_format((float)($incl_vat + $ship_val), 2, '.', ''),
+                    'addvat' => number_format((float)$vat, 2, '.', ''),
+                    'incl_vat' => number_format((float)$incl_vat, 2, '.', '')
+
+                ), 200, []);
+            }
+        }
+        if ($voucher['type'] == 'multiple') {
+            if ($voucher['status'] == 0) {
+                return 'Voucher disabled';
+            } else if ($voucher['expiry_date'] < $date) {
+                return 'Voucher expired';
+            } else {
+                $discountcondition = new \Darryldecode\Cart\CartCondition(array(
+                    'name' => 'discount',
+                    'type' => $voucher['code'],
+                    'target' => 'subtotal',
+                    'value' => '-' . $voucher['discount'] . '%',
+                    'order' => 1
+                ));
+
+                $misc_data = $this->misc_setting();
+                Cart::condition($discountcondition);
+                $cartitems = Cart::getContent();
+                $collection = new Collection();
+                foreach ($cartitems->sort() as $item) {
+                    $collection->push((object)[
+                        'id' => $item->id,
+                        'name' => $item->name,
+                        'quantity' => $item->quentity,
+                        'price_sum' => Cart::get($item->id)->getPriceSum(),
+                    ]);
+                }
+                $ship = Cart::getCondition('Shipping');
+                $ship_val = "";
+                if ($ship != "") {
+                    $location = $ship->getType();
+                    $ship_val = $ship->getValue();
+                }
+                $discount = Cart::getCondition('discount');
+                $discount_val = "";
+                $vat = (Cart::getSubTotal() * $misc_data['vat']) / 100;
+                $incl_vat = Cart::getSubTotal() + $vat;
+                if ($discount != "") {
+                    $discount_val = $discount->getCalculatedValue($collection->sum('price_sum'));
+                    $incl_vat = Cart::getSubTotal() + $vat;
+                }
+
+                return response(array(
+
+                    'message' => 'success',
+                    'subtotal' => number_format((float)$collection->sum('price_sum'), 2, '.', ''),
+                    'discount' => number_format((float)$discount_val, 2, '.', ''),
+                    'ship' => number_format((float)$ship_val, 2, '.', ''),
+                    'total' => number_format((float)($incl_vat + $ship_val), 2, '.', ''),
+                    'addvat' => number_format((float)$vat, 2, '.', ''),
+                    'incl_vat' => number_format((float)$incl_vat, 2, '.', '')
+                ), 200, []);
+            }
+        }
+    }
+    /**
+     * function details:
+     * Remove voucher from cart
+     * @date 13/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function VoucherRemove(Request $request)
+    {
+        Cart::removeCartCondition('discount');
+        $misc_data = $this->misc_setting();
+        $cartitems = Cart::getContent();
+        $collection = new Collection();
+        foreach ($cartitems->sort() as $item) {
+            $collection->push((object)[
+                'id' => $item->id,
+                'name' => $item->name,
+                'quantity' => $item->quentity,
+                'price_sum' => Cart::get($item->id)->getPriceSum(),
+            ]);
+        }
+        $ship = Cart::getCondition('Shipping');
+        $ship_val = "";
+        if ($ship != "") {
+            $location = $ship->getType();
+            $ship_val = $ship->getValue();
+        }
+        $discount = Cart::getCondition('discount');
+        $discount_val = "";
+        if ($discount != "") {
+            $discount_val = $discount->getCalculatedValue($collection->sum('price_sum'));
+        }
+        $vat = (Cart::getSubTotal() * $misc_data['vat']) / 100;
+        return response(array(
+            'message' => 'success',
+            'subtotal' => $collection->sum('price_sum'),
+            'discount' => $discount_val == "" ? '0.00' : number_format((float)$discount_val, 2, '.', ''),
+            'ship' => $ship_val,
+            'total' => number_format((float)Cart::getTotal(), 2, '.', ''),
+            'addvat' => number_format((float)$vat, 2, '.', '')
+        ), 200, []);
+    }
+    /**
+     * function details:
+     * Adding Note
+     * @date 14/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function OrderNote(Request $request)
+    {
+        session(['order_note' => $request->note]);
+        return response()->json('1');
+    }
+    public function checkUserBalance()
+    {
+        $balance = User::where('id', Auth::user()->id)->value('balance');
+        $misc_data = $this->misc_setting();
+        if (Auth::check()) {
+            $vat_status = User::where('id', Auth::user()->id)->value('vat_status');
+            if ($vat_status == 'yes') {
+                $vat = $misc_data['vat'];
+            } else {
+                $vat = 0;
+            }
+        } else {
+            $vat = $misc_data['vat'];
+        }
+        $addvat = (Cart::getSubTotal() * $vat) / 100;
+        $subtotal = Cart::getSubTotal();
+        $discount = Cart::getCondition('discount');
+        $discount_val = 0.00;
+        $incl_vat = $subtotal + $addvat;
+        if ($discount != "") {
+            $discount_val = $discount->getCalculatedValue($subtotal);
+            $incl_vat = ($subtotal - $discount_val) + $addvat;
+        }
+        $ship_val = "";
+        $ship = Cart::getCondition('Shipping');
+        if ($ship != "") {
+
+            $ship_val = $ship->getValue();
+        }
+        if ($ship_val == "") {
+            $grandTotal = $incl_vat;
+        } else {
+            $grandTotal = $incl_vat + $ship_val;
+        }
+        $data = ['balance' => $balance, 'total' => $grandTotal];
+        return response()->json($data);
+    }
+    /**
+     * function details:
+     * Adjust balance
+     * @date 14/12/20
+     * @author Manas Singha
+     * @version 1.0.1
+     * @param
+     */
+    public function addBalance(Request $request)
+    {
+        if (Auth::check()) {
+            $balcondition = new \Darryldecode\Cart\CartCondition(array(
+                'name' => 'adjustment',
+                'type' => 'balance',
+                'target' => 'total',
+                'value' => '-' . $request->bal,
+                'order' => 4,
+                'attributes' => array( // attributes field is optional
+                    'original' => Cart::getSubTotal(),
+                    'bal' => $request->bal
+                )
+            ));
+        } else {
+            $balcondition = new \Darryldecode\Cart\CartCondition(array(
+                'name' => 'adjustment',
+                'type' => 'balance',
+                'target' => 'total',
+                'value' => '-' . 0.00,
+                'order' => 4,
+                'attributes' => array( // attributes field is optional
+                    'original' => Cart::getSubTotal(),
+                    'bal' => 0.00
+                )
+            ));
+        }
+        Cart::condition($balcondition);
+    }
+}
